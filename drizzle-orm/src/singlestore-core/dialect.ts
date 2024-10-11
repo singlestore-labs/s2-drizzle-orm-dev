@@ -1,4 +1,5 @@
 import { aliasedTable, aliasedTableColumn, mapColumnsInAliasedSQLToAlias, mapColumnsInSQLToAlias } from '~/alias.ts';
+import { CasingCache } from '~/casing.ts';
 import { Column } from '~/column.ts';
 import { entityKind, is } from '~/entity.ts';
 import { DrizzleError } from '~/errors.ts';
@@ -16,11 +17,11 @@ import {
 	type TableRelationalConfig,
 	type TablesRelationalConfig,
 } from '~/relations.ts';
-import { Param, SQL, sql, View } from '~/sql/sql.ts';
 import type { Name, QueryWithTypings, SQLChunk } from '~/sql/sql.ts';
+import { Param, SQL, sql, View } from '~/sql/sql.ts';
 import { Subquery } from '~/subquery.ts';
 import { getTableName, getTableUniqueName, Table } from '~/table.ts';
-import { orderSelectedFields, type UpdateSet } from '~/utils.ts';
+import { type Casing, orderSelectedFields, type UpdateSet } from '~/utils.ts';
 import { ViewBaseConfig } from '~/view-common.ts';
 import { SingleStoreColumn } from './columns/common.ts';
 import type { SingleStoreAttachConfig } from './query-builders/attach.ts';
@@ -41,8 +42,19 @@ import type { SingleStoreSession } from './session.ts';
 import { SingleStoreTable } from './table.ts';
 import { SingleStoreViewBase } from './view-base.ts';
 
+export interface SingleStoreDialectConfig {
+	casing?: Casing;
+}
+
 export class SingleStoreDialect {
 	static readonly [entityKind]: string = 'SingleStoreDialect';
+
+	/** @internal */
+	readonly casing: CasingCache;
+
+	constructor(config?: SingleStoreDialectConfig) {
+		this.casing = new CasingCache(config?.casing);
+	}
 
 	async migrate(
 		migrations: MigrationMeta[],
@@ -188,7 +200,7 @@ export class SingleStoreDialect {
 			const col = tableColumns[colName]!;
 
 			const value = set[colName] ?? sql.param(col.onUpdateFn!(), col);
-			const res = sql`${sql.identifier(col.name)} = ${value}`;
+			const res = sql`${sql.identifier(this.casing.getColumnCasing(col))} = ${value}`;
 
 			if (i < setSize - 1) {
 				return [res, sql.raw(', ')];
@@ -242,7 +254,7 @@ export class SingleStoreDialect {
 							new SQL(
 								query.queryChunks.map((c) => {
 									if (is(c, SingleStoreColumn)) {
-										return sql.identifier(c.name);
+										return sql.identifier(this.casing.getColumnCasing(c));
 									}
 									return c;
 								}),
@@ -257,7 +269,7 @@ export class SingleStoreDialect {
 					}
 				} else if (is(field, Column)) {
 					if (isSingleTable) {
-						chunk.push(sql.identifier(field.name));
+						chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
 					} else {
 						chunk.push(field);
 					}
@@ -450,7 +462,7 @@ export class SingleStoreDialect {
 			// which is invalid SingleStore syntax, Table from one of the SELECTs cannot be used in global ORDER clause
 			for (const orderByUnit of orderBy) {
 				if (is(orderByUnit, SingleStoreColumn)) {
-					orderByValues.push(sql.identifier(orderByUnit.name));
+					orderByValues.push(sql.identifier(this.casing.getColumnCasing(orderByUnit)));
 				} else if (is(orderByUnit, SQL)) {
 					for (let i = 0; i < orderByUnit.queryChunks.length; i++) {
 						const chunk = orderByUnit.queryChunks[i];
@@ -490,7 +502,7 @@ export class SingleStoreDialect {
 			!col.shouldDisableInsert()
 		);
 
-		const insertOrder = colEntries.map(([, column]) => sql.identifier(column.name));
+		const insertOrder = colEntries.map(([, column]) => sql.identifier(this.casing.getColumnCasing(column)));
 		const generatedIdsResponse: Record<string, unknown>[] = [];
 
 		for (const [valueIndex, value] of values.entries()) {
@@ -543,6 +555,7 @@ export class SingleStoreDialect {
 
 	sqlToQuery(sql: SQL, invokeSource?: 'indexes' | undefined): QueryWithTypings {
 		return sql.toQuery({
+			casing: this.casing,
 			escapeName: this.escapeName,
 			escapeParam: this.escapeParam,
 			escapeString: this.escapeString,

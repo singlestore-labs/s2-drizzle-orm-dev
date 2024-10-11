@@ -5,12 +5,22 @@ import fetch from 'node-fetch';
 import ws from 'ws';
 import { assertUnreachable } from '../global';
 import type { ProxyParams } from '../serializer/studio';
-import { type DB, normalisePGliteUrl, normaliseSQLiteUrl, type Proxy, type SQLiteDB, type SqliteProxy } from '../utils';
+import {
+	type DB,
+	LibSQLDB,
+	normalisePGliteUrl,
+	normaliseSQLiteUrl,
+	type Proxy,
+	type SQLiteDB,
+	type SqliteProxy,
+} from '../utils';
 import { assertPackages, checkPackage } from './utils';
+import { LibSQLCredentials } from './validations/libsql';
 import type { MysqlCredentials } from './validations/mysql';
 import { withStyle } from './validations/outputs';
 import type { PostgresCredentials } from './validations/postgres';
 import type { SqliteCredentials } from './validations/sqlite';
+import { SingleStoreCredentials } from './validations/singlestore';
 
 export const preparePostgresDB = async (
 	credentials: PostgresCredentials,
@@ -431,6 +441,85 @@ export const connectToMySQL = async (
 	process.exit(1);
 };
 
+const parseSingleStoreCredentials = (credentials: SingleStoreCredentials) => {
+	if ('url' in credentials) {
+		const url = credentials.url;
+
+		const connectionUrl = new URL(url);
+		const pathname = connectionUrl.pathname;
+
+		const database = pathname.split('/')[pathname.split('/').length - 1];
+		if (!database) {
+			console.error(
+				'You should specify a database name in connection string (singlestore://USER:PASSWORD@HOST:PORT/DATABASE)',
+			);
+			process.exit(1);
+		}
+		return { database, url };
+	} else {
+		return {
+			database: credentials.database,
+			credentials,
+		};
+	}
+};
+
+export const connectToSingleStore = async (
+	it: SingleStoreCredentials,
+): Promise<{
+	db: DB;
+	proxy: Proxy;
+	database: string;
+	migrate: (config: MigrationConfig) => Promise<void>;
+}> => {
+	const result = parseSingleStoreCredentials(it);
+
+	if (await checkPackage('mysql2')) {
+		const { createConnection } = await import('mysql2/promise');
+		const { drizzle } = await import('drizzle-orm/singlestore');
+		const { migrate } = await import('drizzle-orm/singlestore/migrator');
+
+		const connection = result.url
+			? await createConnection(result.url)
+			: await createConnection(result.credentials!); // needed for some reason!
+
+		const db = drizzle(connection);
+		const migrateFn = async (config: MigrationConfig) => {
+			return migrate(db, config);
+		};
+
+		await connection.connect();
+		const query: DB['query'] = async <T>(
+			sql: string,
+			params?: any[],
+		): Promise<T[]> => {
+			const res = await connection.execute(sql, params);
+			return res[0] as any;
+		};
+
+		const proxy: Proxy = async (params: ProxyParams) => {
+			const result = await connection.query({
+				sql: params.sql,
+				values: params.params,
+				rowsAsArray: params.mode === 'array',
+			});
+			return result[0] as any[];
+		};
+
+		return {
+			db: { query },
+			proxy,
+			database: result.database,
+			migrate: migrateFn,
+		};
+	}
+
+	console.error(
+		"To connect to SingleStore database - please install 'singlestore' driver",
+	);
+	process.exit(1);
+};
+
 const prepareSqliteParams = (params: any[], driver?: string) => {
 	return params.map((param) => {
 		if (
@@ -482,56 +571,7 @@ export const connectToSQLite = async (
 > => {
 	if ('driver' in credentials) {
 		const { driver } = credentials;
-		if (driver === 'turso') {
-			assertPackages('@libsql/client');
-			const { createClient } = await import('@libsql/client');
-			const { drizzle } = await import('drizzle-orm/libsql');
-			const { migrate } = await import('drizzle-orm/libsql/migrator');
-
-			const client = createClient({
-				url: credentials.url,
-				authToken: credentials.authToken,
-			});
-
-			const drzl = drizzle(client);
-			const migrateFn = async (config: MigrationConfig) => {
-				return migrate(drzl, config);
-			};
-
-			const db: SQLiteDB = {
-				query: async <T>(sql: string, params?: any[]) => {
-					const res = await client.execute({ sql, args: params || [] });
-					return res.rows as T[];
-				},
-				run: async (query: string) => {
-					await client.execute(query);
-				},
-				batch: async (
-					queries: { query: string; values?: any[] | undefined }[],
-				) => {
-					await client.batch(
-						queries.map((it) => ({ sql: it.query, args: it.values ?? [] })),
-					);
-				},
-			};
-			const proxy: SqliteProxy = {
-				proxy: async (params: ProxyParams) => {
-					const preparedParams = prepareSqliteParams(params.params);
-					const result = await client.execute({
-						sql: params.sql,
-						args: preparedParams,
-					});
-
-					if (params.mode === 'array') {
-						return result.rows.map((row) => Object.values(row));
-					} else {
-						return result.rows;
-					}
-				},
-			};
-
-			return { ...db, ...proxy, migrate: migrateFn };
-		} else if (driver === 'd1-http') {
+		if (driver === 'd1-http') {
 			const { drizzle } = await import('drizzle-orm/sqlite-proxy');
 			const { migrate } = await import('drizzle-orm/sqlite-proxy/migrator');
 
@@ -708,8 +748,66 @@ export const connectToSQLite = async (
 		};
 		return { ...db, ...proxy, migrate: migrateFn };
 	}
+
 	console.log(
 		"Please install either 'better-sqlite3' or '@libsql/client' for Drizzle Kit to connect to SQLite databases",
+	);
+	process.exit(1);
+};
+
+export const connectToLibSQL = async (credentials: LibSQLCredentials): Promise<
+	& LibSQLDB
+	& SqliteProxy
+	& { migrate: (config: MigrationConfig) => Promise<void> }
+> => {
+	if (await checkPackage('@libsql/client')) {
+		const { createClient } = await import('@libsql/client');
+		const { drizzle } = await import('drizzle-orm/libsql');
+		const { migrate } = await import('drizzle-orm/libsql/migrator');
+
+		const client = createClient({
+			url: normaliseSQLiteUrl(credentials.url, 'libsql'),
+			authToken: credentials.authToken,
+		});
+		const drzl = drizzle(client);
+		const migrateFn = async (config: MigrationConfig) => {
+			return migrate(drzl, config);
+		};
+
+		const db: LibSQLDB = {
+			query: async <T>(sql: string, params?: any[]) => {
+				const res = await client.execute({ sql, args: params || [] });
+				return res.rows as T[];
+			},
+			run: async (query: string) => {
+				await client.execute(query);
+			},
+			batchWithPragma: async (queries: string[]) => {
+				await client.migrate(queries);
+			},
+		};
+
+		const proxy: SqliteProxy = {
+			proxy: async (params: ProxyParams) => {
+				const preparedParams = prepareSqliteParams(params.params);
+				const result = await client.execute({
+					sql: params.sql,
+					args: preparedParams,
+				});
+
+				if (params.mode === 'array') {
+					return result.rows.map((row) => Object.values(row));
+				} else {
+					return result.rows;
+				}
+			},
+		};
+
+		return { ...db, ...proxy, migrate: migrateFn };
+	}
+
+	console.log(
+		"Please install '@libsql/client' for Drizzle Kit to connect to LibSQL databases",
 	);
 	process.exit(1);
 };
