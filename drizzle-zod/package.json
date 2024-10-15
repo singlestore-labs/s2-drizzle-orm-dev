@@ -74,7 +74,7 @@
 		"cpy": "^10.1.0",
 		"drizzle-orm": "link:../drizzle-orm/dist",
 		"rimraf": "^5.0.0",
-		"rollup": "^3.20.7",
+		"rollup": "^3.29.5",
 		"vite-tsconfig-paths": "^4.3.2",
 		"vitest": "^1.6.0",
 		"zod": "^3.20.2",
